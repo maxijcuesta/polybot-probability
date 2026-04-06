@@ -113,28 +113,40 @@ class RiskEngine:
             )
             return _rejected(RejectReason.DAILY_CAP_EXHAUSTED)
 
-        if signal.edge_net <= 0:
-            return _rejected(RejectReason.NO_EDGE)
-
         # ── 2. Kelly / fracción fija ──────────────────────────────────────────
+        # NO_EDGE gate removed: InefficiencyScorer is the entry gate; the risk
+        # engine is responsible only for sizing, caps and exposure limits.
+        #
+        # When edge_net > 0: standard fractional Kelly (kelly_fraction × f*)
+        # When edge_net ≤ 0: fixed-fraction sizing (max_risk_per_trade_pct).
+        #   Kelly with non-positive edge yields f* = 0 → requested_size = $0
+        #   → would always hit BELOW_MIN_SIZE. Fixed fraction ensures we can
+        #   still size the trade that the scorer already qualified.
 
         edge = signal.edge_net
-        if rc.use_kelly:
-            entry_price = (
-                signal.p_market if signal.side.value == "YES"
-                else 1.0 - signal.p_market
-            )
-            entry_price = max(entry_price, 1e-6)
+        entry_price = (
+            signal.p_market if signal.side.value == "YES"
+            else 1.0 - signal.p_market
+        )
+        entry_price = max(entry_price, 1e-6)
+
+        if rc.use_kelly and edge > 0:
             odds = (1.0 - entry_price) / entry_price
             kelly_f_raw = min(edge / max(odds, 1e-6), 1.0)  # Kelly puro (sin fracción)
             fraction = rc.kelly_fraction * kelly_f_raw
         else:
-            entry_price = (
-                signal.p_market if signal.side.value == "YES"
-                else 1.0 - signal.p_market
-            )
+            # Score-selected trade with non-positive edge: use fixed fraction.
+            # Kelly would give f* = 0; instead we bet max_risk_per_trade_pct.
             kelly_f_raw = None
             fraction = rc.max_risk_per_trade_pct / 100.0
+            if edge <= 0:
+                logger.debug(
+                    "risk.fixed_fraction_sizing",
+                    market_id=signal.market_id,
+                    edge_net=round(edge, 4),
+                    reason="score_selected_non_positive_edge",
+                    fraction_pct=rc.max_risk_per_trade_pct,
+                )
 
         # Cap por trade (trade_cap): fracción máxima de bankroll por operación
         max_fraction = rc.max_risk_per_trade_pct / 100.0
