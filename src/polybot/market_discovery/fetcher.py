@@ -226,31 +226,75 @@ class MarketFetcher:
                 "limit": page_size,
                 "offset": offset,
             }
+            url = f"{self._gamma_base}/markets"
             try:
-                resp = await client.get(f"{self._gamma_base}/markets", params=params)
+                resp = await client.get(url, params=params)
                 resp.raise_for_status()
-                raw_list: list[dict] = resp.json()
+                data = resp.json()
             except httpx.HTTPStatusError as exc:
                 logger.error(
                     "fetcher.gamma_http_error",
+                    url=url,
                     status=exc.response.status_code,
                     offset=offset,
                 )
                 break
             except httpx.RequestError as exc:
-                logger.error("fetcher.gamma_request_error", error=str(exc), offset=offset)
+                logger.error("fetcher.gamma_request_error", url=url, error=str(exc), offset=offset)
                 break
             except Exception as exc:
-                logger.error("fetcher.gamma_unexpected", error=str(exc), offset=offset)
+                logger.error("fetcher.gamma_unexpected", url=url, error=str(exc), offset=offset)
                 break
+
+            # Gamma API returns either a plain list or a paginated dict.
+            # Old format: [{...}, ...]
+            # New format: {"data": [{...}, ...], "count": N, "next_cursor": "..."}
+            if isinstance(data, list):
+                raw_list: list[dict] = data
+            elif isinstance(data, dict):
+                raw_list = data.get("data", data.get("results", data.get("markets", [])))
+                if not isinstance(raw_list, list):
+                    logger.warning(
+                        "fetcher.unexpected_response_shape",
+                        url=url,
+                        offset=offset,
+                        keys=list(data.keys()),
+                        sample=str(data)[:300],
+                    )
+                    raw_list = []
+            else:
+                logger.warning(
+                    "fetcher.unexpected_response_type",
+                    url=url,
+                    offset=offset,
+                    type=type(data).__name__,
+                    sample=str(data)[:300],
+                )
+                raw_list = []
+
+            logger.debug(
+                "fetcher.page_received",
+                url=url,
+                offset=offset,
+                raw_count=len(raw_list),
+            )
 
             if not raw_list:
                 break  # No more pages
 
+            parsed_before = len(markets)
             for raw in raw_list:
                 snapshot = _parse_gamma_market(raw)
                 if snapshot is not None:
                     markets.append(snapshot)
+
+            logger.debug(
+                "fetcher.page_parsed",
+                offset=offset,
+                raw=len(raw_list),
+                parsed=len(markets) - parsed_before,
+                running_total=len(markets),
+            )
 
             if len(raw_list) < page_size:
                 break  # Last page

@@ -1153,11 +1153,23 @@ async def fetch_dashboard_data(config: BotConfig) -> dict:
                 pass
 
             # Funnel counts from last cycle summary (approx from DB counts)
-            markets_count_row = await q1("SELECT COUNT(DISTINCT market_id) as n FROM snapshots") \
-                if True else None
-            signals_count_row = await q1("SELECT COUNT(*) as n FROM signals WHERE edge_net > 0") \
-                if True else None
-            executed_count_row = await q1("SELECT COUNT(*) as n FROM trades")
+            # market_snapshots = table name in schema (was incorrectly "snapshots")
+            try:
+                markets_count_row = await q1(
+                    "SELECT COUNT(DISTINCT market_id) as n FROM market_snapshots"
+                )
+            except Exception:
+                markets_count_row = None
+            try:
+                signals_count_row = await q1(
+                    "SELECT COUNT(*) as n FROM signals WHERE edge_net > 0"
+                )
+            except Exception:
+                signals_count_row = None
+            try:
+                executed_count_row = await q1("SELECT COUNT(*) as n FROM trades")
+            except Exception:
+                executed_count_row = None
 
             funnel = {
                 "scanned": (markets_count_row or {}).get("n") or 0,
