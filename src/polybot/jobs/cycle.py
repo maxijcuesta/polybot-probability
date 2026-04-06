@@ -128,6 +128,9 @@ class BotCycle:
             "exited":            0,
         }
         positions_opened = 0
+        # Track why signals are not actionable, for per-cycle diagnostics.
+        # Keys are rejection_reason() strings; values are counts.
+        rejection_counts: dict[str, int] = {}
 
         # Step 2-8: Process each market
         for market in markets:
@@ -157,6 +160,8 @@ class BotCycle:
 
                 # Only actionable signals proceed: guard passed AND edge_net > 0
                 if not self.signals.is_actionable(sig):
+                    reason = self.signals.rejection_reason(sig)
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                     continue
                 funnel["positive_edge_net"] += 1
 
@@ -208,6 +213,17 @@ class BotCycle:
             except Exception as e:
                 logger.error("cycle.market_error", market_id=market.market_id, error=str(e))
                 continue
+
+        # Per-cycle rejection summary (diagnostic — emitted only when there are rejections)
+        if rejection_counts:
+            # Sort by count descending so the dominant reason appears first
+            top = sorted(rejection_counts.items(), key=lambda x: x[1], reverse=True)
+            logger.info(
+                "cycle.signal_rejections",
+                cycle_id=cycle_id,
+                total_rejected=sum(rejection_counts.values()),
+                breakdown={r: c for r, c in top},
+            )
 
         # Step 9: Check exits for open positions
         for trade in list(self._portfolio.open_trades):

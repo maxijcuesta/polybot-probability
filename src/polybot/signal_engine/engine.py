@@ -93,3 +93,25 @@ class SignalEngine:
         if abs(signal.edge_raw) < self.config.model.min_edge_raw:
             return False
         return True
+
+    def rejection_reason(self, signal: Signal) -> str:
+        """
+        Returns the first failing check for a non-actionable signal.
+        Used for diagnostics only — not part of the trading logic.
+        """
+        if not signal.guard_result.passed:
+            reasons = [r.value for r in signal.guard_result.failures]
+            return f"guard_failed:{','.join(reasons) if reasons else 'unknown'}"
+        if signal.edge_net < self.config.model.min_edge_net:
+            return (
+                f"edge_net_below_min("
+                f"edge_net={signal.edge_net:.4f} "
+                f"< min={self.config.model.min_edge_net})"
+            )
+        if abs(signal.edge_raw) < self.config.model.min_edge_raw:
+            return (
+                f"edge_raw_below_min("
+                f"abs_edge_raw={abs(signal.edge_raw):.4f} "
+                f"< min={self.config.model.min_edge_raw})"
+            )
+        return "actionable"
