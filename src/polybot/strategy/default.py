@@ -1,25 +1,24 @@
 from __future__ import annotations
-from ..probability_model.naive import NaiveModel
+from ..probability_model.inefficiency_model import InefficiencyModel
 from ..calibration.calibrator import IdentityCalibrator
 from ..config import BotConfig
 
+
 class DefaultStrategy:
     """
-    Default strategy: NaiveModel + IdentityCalibrator.
+    Default strategy: InefficiencyModel + IdentityCalibrator.
 
-    The NaiveModel uses market mid-price as baseline probability
-    and applies small adjustments for depth imbalance and volume.
+    The InefficiencyModel uses microprice (depth-weighted mid) as baseline
+    P(YES), grounded in market microstructure. The final_trade_score from
+    InefficiencyScorer handles candidate ranking in cycle.py.
 
-    Replace this with a trained model when you have enough historical data.
+    Replace with a trained model once you have sufficient resolved trades.
     See strategy/README for instructions.
     """
 
     def __init__(self, config: BotConfig):
         self.config = config
-        self.model = NaiveModel(
-            depth_weight=0.03,
-            volume_weight=0.01,
-        )
+        self.model = InefficiencyModel()
         # Use IdentityCalibrator until we have 30+ trades for calibration
         self.calibrator = IdentityCalibrator()
 

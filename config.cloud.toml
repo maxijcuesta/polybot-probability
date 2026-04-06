@@ -20,6 +20,13 @@ min_edge_net = 0.005        # was 0.02 — net edge after simulated costs
 [guards]
 min_volume_24h_usd = 2500.0 # was 10000 — opens universe to more real markets
 
+# ── Scoring / ranking ─────────────────────────────────────────────────────────
+# InefficiencyScorer ranks ALL guard-passed markets; top N go to risk engine.
+# This replaces the hard min_edge_raw / min_edge_net threshold gate.
+[scoring]
+top_n_per_cycle  = 5     # max trades to attempt per scan cycle
+min_final_score  = 0.25  # discard markets below this composite score
+
 [dashboard]
 host            = "0.0.0.0" # must be 0.0.0.0 for Fly.io health checks
 port            = 8080

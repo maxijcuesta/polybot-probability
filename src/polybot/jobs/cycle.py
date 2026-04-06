@@ -4,7 +4,7 @@ import uuid
 import structlog
 from datetime import datetime, timezone
 from ..config import BotConfig
-from ..models import PortfolioState, Trade, TradeStatus, utc_now
+from ..models import MarketSnapshot, PortfolioState, Trade, TradeStatus, utc_now
 from ..market_discovery.fetcher import MarketFetcher
 from ..market_discovery.filters import OperationalGuards
 from ..feature_builder.builder import FeatureBuilder
@@ -14,6 +14,7 @@ from ..execution_engine.paper import PaperExecutionEngine
 from ..analytics.metrics import MetricsEngine
 from ..analytics.validation import ValidationEngine
 from ..strategy.default import DefaultStrategy
+from ..scoring import InefficiencyScore, InefficiencyScorer
 from .. import db as storage
 
 logger = structlog.get_logger(__name__)
@@ -21,23 +22,49 @@ logger = structlog.get_logger(__name__)
 
 class BotCycle:
     """
-    Main bot orchestration loop.
+    Main bot orchestration loop — score-based ranking edition.
 
-    Each cycle:
-    1.  Fetch active markets (MarketFetcher)
-    2.  Apply operational guards (OperationalGuards)
-    3.  Build features (FeatureBuilder)
-    4.  Predict probabilities (model)
-    5.  Calibrate predictions (calibrator)
-    6.  Compute signals (SignalEngine)
-    7.  Size positions (RiskEngine)  — always returns SizingDecision for funnel tracking
-    8.  Execute / update positions (ExecutionEngine)
-    9.  Check exits for open positions
-    10. Persist funnel event summary
-    11. Compute metrics (MetricsEngine)
+    Each cycle runs in two phases:
 
-    Runs in paper_trade mode by default.
-    Set config.operation.live_trade=True for live execution.
+    Phase 1 — Score all markets (per-market, independent):
+      1.  Fetch active markets (MarketFetcher)
+      2.  Apply operational guards (OperationalGuards)
+      3.  Build features (FeatureBuilder)
+      4.  Predict probability (InefficiencyModel via strategy)
+      5.  Calibrate predictions
+      6.  Compute signal (SignalEngine)         — saved to DB for all markets
+      7.  Score market (InefficiencyScorer)     — transversal microstructure score
+      8.  Filter: guard.passed AND score ≥ min_final_score → candidates list
+
+    Phase 2 — Rank and execute top N:
+      9.  Sort candidates by final_trade_score descending
+      10. Take top top_n_per_cycle
+      11. For each: check existing position → risk sizing → paper execution
+      12. Check exits for open positions
+      13. Persist funnel event summary
+      14. Compute metrics
+
+    Why two phases instead of one pass:
+      - Ranking requires knowing all scores before selecting any.
+      - Prevents "first come, first served" bias toward markets fetched first.
+      - Keeps risk budget focused on the best opportunities each cycle.
+
+    Funnel counters
+    ---------------
+      markets_fetched   — total markets returned by fetcher
+      signals_computed  — markets for which a signal was computed and saved
+      passed_guards     — subset where guard_result.passed = True
+      scored_above_min  — guard-passed markets scoring ≥ min_final_score
+      positive_edge_net — top N selected for risk evaluation (≤ scored_above_min)
+      already_positioned— selected candidates skipped: position already open
+      risk_approved     — sent to risk engine and approved
+      risk_rejected     — sent to risk engine and rejected
+      risk_trimmed      — approved but size was capped
+      executed          — positions actually opened
+      exited            — positions closed this cycle
+
+    Invariant:
+      already_positioned + risk_approved + risk_rejected = positive_edge_net
     """
 
     def __init__(self, config: BotConfig):
@@ -47,6 +74,7 @@ class BotCycle:
         self.guards = OperationalGuards(config.guards)
         self.features = FeatureBuilder()
         self.signals = SignalEngine(config)
+        self.scorer = InefficiencyScorer()
         self.risk = RiskEngine(config)
         self.executor = PaperExecutionEngine(config)
         self.metrics_engine = MetricsEngine()
@@ -68,12 +96,14 @@ class BotCycle:
         cycle_start = utc_now()
         today_str = cycle_start.strftime("%Y-%m-%d")
 
-        logger.info("cycle.start", cycle_id=cycle_id, mode="paper" if self.config.operation.paper_trade else "live")
+        logger.info(
+            "cycle.start",
+            cycle_id=cycle_id,
+            mode="paper" if self.config.operation.paper_trade else "live",
+        )
 
-        # Ensure DB schema (handles migrations automatically)
         await storage.ensure_schema(self.config.operation.db_path)
 
-        # Load open positions from DB
         open_trades = await storage.load_open_trades(self.config.operation.db_path)
         self._portfolio = PortfolioState(
             open_trades=open_trades,
@@ -94,86 +124,105 @@ class BotCycle:
 
         logger.info("cycle.markets_fetched", n=len(markets))
 
-        # ── Contadores de funnel del ciclo ────────────────────────────────────
-        # Definición exacta de cada etapa:
-        #
-        #  markets_fetched   — mercados devueltos por MarketFetcher.fetch_active_markets()
-        #  passed_guards     — subset de signals_computed donde guard_result.passed = True
-        #  signals_computed  — mercados para los que se calculó y persistió una señal
-        #                      (≤ markets_fetched si algún mercado lanza excepción)
-        #  positive_edge_net — señales is_actionable(): guard + edge_net ≥ min_edge_net
-        #                      + edge_raw ≥ min_edge_raw
-        #  already_positioned— señales accionables descartadas porque ese mercado ya
-        #                      tiene una posición abierta en el portfolio (sin enviar
-        #                      al risk engine; no cuentan como rejected)
-        #  risk_approved     — señales enviadas al risk engine con SizingDecision.approved=True
-        #  risk_rejected     — señales enviadas al risk engine con SizingDecision.approved=False
-        #  risk_trimmed      — subset de risk_approved con SizingDecision.risk_limited=True
-        #                      (tamaño aprobado < tamaño solicitado)
-        #  executed          — posiciones abiertas efectivamente (paper o live)
-        #  exited            — posiciones cerradas en este ciclo
-        #
-        # Invariante: risk_approved + risk_rejected + already_positioned
-        #             = positive_edge_net  (modulo errores de excepción)
+        # ── Funnel counters ───────────────────────────────────────────────────
         funnel: dict[str, int] = {
-            "markets_fetched":   len(markets),
-            "passed_guards":     0,
-            "signals_computed":  0,
-            "positive_edge_net": 0,
-            "already_positioned": 0,  # accionables omitidos por posición existente
-            "risk_approved":     0,
-            "risk_rejected":     0,
-            "risk_trimmed":      0,
-            "executed":          0,
-            "exited":            0,
+            "markets_fetched":    len(markets),
+            "passed_guards":      0,
+            "signals_computed":   0,
+            "scored_above_min":   0,   # passed scoring gate (informational)
+            "positive_edge_net":  0,   # top N actually sent to risk engine
+            "already_positioned": 0,
+            "risk_approved":      0,
+            "risk_rejected":      0,
+            "risk_trimmed":       0,
+            "executed":           0,
+            "exited":             0,
         }
         positions_opened = 0
-        # Track why signals are not actionable, for per-cycle diagnostics.
-        # Keys are rejection_reason() strings; values are counts.
+
+        # Tracks why non-selected markets were skipped (diagnostic only).
         rejection_counts: dict[str, int] = {}
 
-        # Step 2-8: Process each market
+        # ── PHASE 1: score every market, collect candidates ───────────────────
+        # candidates: list of (snapshot, signal, score) sorted later by score
+        candidates: list[tuple[MarketSnapshot, object, InefficiencyScore]] = []
+
         for market in markets:
             try:
-                # Persist snapshot
                 await storage.save_market_snapshot(self.config.operation.db_path, market)
 
-                # 2. Guards
-                guard = self.guards.check(market)
+                guard  = self.guards.check(market)
+                feats  = self.features.build(market)
+                pred   = self.strategy.model.predict(feats)
+                cal    = self.strategy.calibrator.calibrate(pred)
+                sig    = self.signals.compute_signal(market, feats, cal, guard)
 
-                # 3. Features
-                feats = self.features.build(market)
-
-                # 4. Model
-                prediction = self.strategy.model.predict(feats)
-
-                # 5. Calibrate
-                calibrated = self.strategy.calibrator.calibrate(prediction)
-
-                # 6. Signal — computed for ALL markets regardless of guard outcome
-                sig = self.signals.compute_signal(market, feats, calibrated, guard)
                 await storage.save_signal(self.config.operation.db_path, sig)
                 funnel["signals_computed"] += 1
 
                 if guard.passed:
                     funnel["passed_guards"] += 1
 
-                # Only actionable signals proceed: guard passed AND edge_net > 0
-                if not self.signals.is_actionable(sig):
-                    reason = self.signals.rejection_reason(sig)
-                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                # Gate 1: guard must pass
+                if not guard.passed:
+                    reasons = [r.value for r in guard.failures]
+                    key = f"guard_failed:{','.join(reasons) if reasons else 'unknown'}"
+                    rejection_counts[key] = rejection_counts.get(key, 0) + 1
                     continue
-                funnel["positive_edge_net"] += 1
 
-                # Descartar si ya hay posición abierta en este mercado.
-                # Se cuenta por separado para no contaminar risk_rejected.
+                # Gate 2: score the market
+                score = self.scorer.score(market, feats)
+
+                if score.final_trade_score < self.config.scoring.min_final_score:
+                    key = (
+                        f"below_min_score("
+                        f"score={score.final_trade_score:.3f}"
+                        f"<min={self.config.scoring.min_final_score})"
+                    )
+                    rejection_counts[key] = rejection_counts.get(key, 0) + 1
+                    continue
+
+                funnel["scored_above_min"] += 1
+                candidates.append((market, sig, score))
+
+            except Exception as e:
+                logger.error("cycle.market_error", market_id=market.market_id, error=str(e))
+                continue
+
+        # Per-cycle rejection summary — one INFO line with the full breakdown
+        if rejection_counts:
+            top = sorted(rejection_counts.items(), key=lambda x: x[1], reverse=True)
+            logger.info(
+                "cycle.signal_rejections",
+                cycle_id=cycle_id,
+                total_rejected=sum(rejection_counts.values()),
+                breakdown={r: c for r, c in top},
+            )
+
+        # ── PHASE 2: rank by score, execute top N ─────────────────────────────
+        candidates.sort(key=lambda x: x[2].final_trade_score, reverse=True)
+        top_candidates = candidates[: self.config.scoring.top_n_per_cycle]
+        funnel["positive_edge_net"] = len(top_candidates)
+
+        if top_candidates:
+            logger.info(
+                "cycle.top_candidates",
+                cycle_id=cycle_id,
+                n_candidates=len(candidates),
+                n_selected=len(top_candidates),
+                top_score=top_candidates[0][2].final_trade_score,
+                bottom_score=top_candidates[-1][2].final_trade_score,
+            )
+
+        for market, sig, score in top_candidates:
+            try:
+                # Skip if already holding a position in this market
                 if any(t.market_id == market.market_id for t in self._portfolio.open_trades):
                     funnel["already_positioned"] += 1
                     continue
 
-                # 7. Size — always returns SizingDecision for full funnel tracking
+                # Risk sizing — always returns SizingDecision for funnel tracking
                 decision = self.risk.size_position(sig, self._portfolio, today_str)
-                # Persist sizing outcome back to the signal row
                 await storage.update_signal_sizing(
                     self.config.operation.db_path, sig.signal_id, decision
                 )
@@ -187,11 +236,11 @@ class BotCycle:
                         requested_usd=decision.requested_size_usd,
                     )
                     continue
+
                 funnel["risk_approved"] += 1
                 if decision.risk_limited:
                     funnel["risk_trimmed"] += 1
 
-                # 8. Execute (paper mode)
                 if self.config.operation.paper_trade:
                     size = decision.to_size_result()
                     trade = await self.executor.open_position(sig, size)
@@ -208,24 +257,17 @@ class BotCycle:
                         approved_usd=decision.approved_size_usd,
                         requested_usd=decision.requested_size_usd,
                         trim_reason=decision.trim_reason,
+                        final_trade_score=score.final_trade_score,
+                        inefficiency_score=score.inefficiency_score,
+                        execution_score=score.execution_score,
+                        suggested_side=score.suggested_side,
                     )
 
             except Exception as e:
                 logger.error("cycle.market_error", market_id=market.market_id, error=str(e))
                 continue
 
-        # Per-cycle rejection summary (diagnostic — emitted only when there are rejections)
-        if rejection_counts:
-            # Sort by count descending so the dominant reason appears first
-            top = sorted(rejection_counts.items(), key=lambda x: x[1], reverse=True)
-            logger.info(
-                "cycle.signal_rejections",
-                cycle_id=cycle_id,
-                total_rejected=sum(rejection_counts.values()),
-                breakdown={r: c for r, c in top},
-            )
-
-        # Step 9: Check exits for open positions
+        # Step 12: Check exits for open positions
         for trade in list(self._portfolio.open_trades):
             try:
                 current_price = await self._get_current_price(trade.market_id, markets)
@@ -245,7 +287,7 @@ class BotCycle:
             except Exception as e:
                 logger.error("cycle.exit_error", trade_id=trade.trade_id, error=str(e))
 
-        # Step 10: Persistir eventos de funnel (formato EAV — una fila por contador)
+        # Step 13: Persist funnel events
         await storage.save_funnel_events(
             self.config.operation.db_path,
             cycle_id=cycle_id,
@@ -253,10 +295,8 @@ class BotCycle:
             created_at=cycle_start.isoformat(),
         )
 
-        # Step 11: Recalibrate if enough data
+        # Step 14: Recalibrate + metrics
         await self._maybe_recalibrate()
-
-        # Step 12: Metrics
         all_trades = await storage.load_all_trades(self.config.operation.db_path, limit=500)
         metrics = self.metrics_engine.compute(all_trades)
 
@@ -296,7 +336,11 @@ class BotCycle:
         self._running = True
         interval = self.config.operation.scan_interval_seconds
 
-        logger.info("bot.starting", paper_trade=self.config.operation.paper_trade, interval=interval)
+        logger.info(
+            "bot.starting",
+            paper_trade=self.config.operation.paper_trade,
+            interval=interval,
+        )
 
         while self._running:
             try:

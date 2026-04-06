@@ -97,6 +97,25 @@ class ExitConfig:
 
 
 @dataclass(slots=True)
+class ScoringConfig:
+    """
+    Inefficiency scoring and ranking configuration.
+
+    Replaces the hard min_edge_raw / min_edge_net threshold gate with a
+    score-based ranking system. Markets are scored by InefficiencyScorer,
+    filtered by min_final_score, then the top top_n_per_cycle candidates
+    are sent to the risk engine each cycle.
+    """
+    # Max candidates to attempt per cycle (keeps capital rotation fast).
+    top_n_per_cycle: int = 5
+
+    # Minimum final_trade_score to be considered at all. Score ∈ [0, 1].
+    # 0.25 passes markets with decent spread + reasonably fresh quotes.
+    # Raise to 0.40+ once you have paper-trade data and want to be selective.
+    min_final_score: float = 0.25
+
+
+@dataclass(slots=True)
 class DashboardConfig:
     host: str = "127.0.0.1"
     port: int = 8080
@@ -114,6 +133,7 @@ class BotConfig:
     costs: CostConfig = field(default_factory=CostConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     exit: ExitConfig = field(default_factory=ExitConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
 
     @classmethod
@@ -127,6 +147,7 @@ class BotConfig:
         co = raw.get("costs", {})
         ri = raw.get("risk", {})
         ex = raw.get("exit", {})
+        sc = raw.get("scoring", {})
         da = raw.get("dashboard", {})
         return cls(
             operation=OperationConfig(**{k: v for k, v in op.items() if hasattr(OperationConfig, k)}),
@@ -136,6 +157,7 @@ class BotConfig:
             costs=CostConfig(**{k: v for k, v in co.items() if hasattr(CostConfig, k)}),
             risk=RiskConfig(**{k: v for k, v in ri.items() if hasattr(RiskConfig, k)}),
             exit=ExitConfig(**{k: v for k, v in ex.items() if hasattr(ExitConfig, k)}),
+            scoring=ScoringConfig(**{k: v for k, v in sc.items() if hasattr(ScoringConfig, k)}),
             dashboard=DashboardConfig(**{k: v for k, v in da.items() if hasattr(DashboardConfig, k)}),
         )
 

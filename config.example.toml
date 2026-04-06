@@ -58,6 +58,13 @@ stop_loss_pct = 0.10             # exit at -10%
 max_hold_hours = 72.0
 exit_on_edge_flip = true
 
+[scoring]
+# InefficiencyScorer ranks ALL guard-passed markets by composite microstructure
+# score, then sends the top top_n_per_cycle candidates to the risk engine.
+# This replaces the hard min_edge_raw / min_edge_net threshold gate.
+top_n_per_cycle = 5     # max trades to attempt per scan cycle
+min_final_score = 0.25  # discard markets with final_trade_score below this
+
 [dashboard]
 host = "127.0.0.1"
 port = 8080
