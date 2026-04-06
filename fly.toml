@@ -1,0 +1,60 @@
+# Configuración Fly.io — polybot-probability
+#
+# Primera vez:
+#   fly auth login
+#   fly apps create polybot-probability
+#   fly volumes create polybot_data --size 1 --region iad
+#   fly deploy
+#
+# Actualizar código:
+#   fly deploy
+#
+# Ver logs:
+#   fly logs
+#
+# Ver dashboard:
+#   fly open   (→ https://polybot-probability.fly.dev)
+
+app            = "polybot-probability"
+primary_region = "iad"   # us-east — menor latencia a Polymarket
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLYBOT_DB_PATH = "/data/polybot.db"   # directorio del volumen persistente
+
+[[mounts]]
+  # Volumen persistente para SQLite — los trades se conservan entre reinicios.
+  # Crear antes del primer deploy:
+  #   fly volumes create polybot_data --size 1 --region iad
+  source      = "polybot_data"
+  destination = "/data"
+
+# ── Servicio HTTP: dashboard + health check ────────────────────────────────────
+[[services]]
+  internal_port      = 8080
+  protocol           = "tcp"
+  auto_stop_machines = false   # nunca apagar aunque no haya tráfico HTTP
+
+  [[services.ports]]
+    port     = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port     = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval     = "30s"
+    timeout      = "5s"
+    grace_period = "90s"
+    method       = "GET"
+    path         = "/health"
+
+[[vm]]
+  # shared-cpu-1x, 256MB RAM — suficiente para paper mode
+  # Fly.io incluye 3 VMs shared en el free allowance
+  cpu_kind  = "shared"
+  cpus      = 1
+  memory_mb = 256

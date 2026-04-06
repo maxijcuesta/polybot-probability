@@ -11,6 +11,7 @@ Usage:
 """
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -38,8 +39,11 @@ async def main():
     else:
         config = BotConfig.defaults()
 
+    # DB path: --db flag > POLYBOT_DB_PATH env var > config default
     if args.db:
         config.operation.db_path = args.db
+    elif os.environ.get("POLYBOT_DB_PATH"):
+        config.operation.db_path = os.environ["POLYBOT_DB_PATH"]
 
     await storage.ensure_schema(config.operation.db_path)
 

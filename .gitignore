@@ -34,9 +34,7 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Fly.io / Docker
-fly.toml
-Dockerfile
+# Docker build cache only — Dockerfile and fly.toml are tracked
 .dockerignore
 
 # Coverage
