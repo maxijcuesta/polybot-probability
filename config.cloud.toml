@@ -1,5 +1,5 @@
 # Cloud-specific overrides for Fly.io / Docker
-# Inherits all defaults; only dashboard host differs so Fly.io can reach it.
+# Inherits all defaults for keys not listed here.
 
 [operation]
 paper_trade = true
@@ -7,6 +7,18 @@ live_trade  = false
 dry_run     = true
 log_level   = "INFO"
 log_json    = true          # JSON logs — easier to parse in cloud log viewers
+
+# ── Thresholds lowered for paper-trading observation ──────────────────────────
+# NaiveModel max edge_raw ≈ 0.035, which is below the example-config default of
+# 0.04. These values let the model generate signals so we can observe real
+# paper-trade behaviour. They do NOT imply the strategy is validated.
+# Review and tighten after collecting ≥ 30 closed paper trades.
+[model]
+min_edge_raw = 0.02         # was 0.04 — NaiveModel ceiling is ~0.035
+min_edge_net = 0.005        # was 0.02 — net edge after simulated costs
+
+[guards]
+min_volume_24h_usd = 2500.0 # was 10000 — opens universe to more real markets
 
 [dashboard]
 host            = "0.0.0.0" # must be 0.0.0.0 for Fly.io health checks

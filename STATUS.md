@@ -73,6 +73,22 @@ approved_size_usd ≤ requested_size_usd  (nunca se aprueba más de lo pedido)
 
 ---
 
+## Thresholds de paper trading (cloud)
+
+Los umbrales en `config.cloud.toml` fueron bajados deliberadamente para destrabar la
+observación de paper trades reales. **Esto no implica que la estrategia esté validada.**
+
+| Parámetro | Default (`config.example.toml`) | Cloud (`config.cloud.toml`) | Motivo |
+|---|---|---|---|
+| `model.min_edge_raw` | 0.04 | **0.02** | NaiveModel techo ≈ 0.035; con 0.04 nunca pasa |
+| `model.min_edge_net` | 0.02 | **0.005** | Margen neto realista para paper mode |
+| `guards.min_volume_24h_usd` | 10 000 | **2 500** | Abre universo a mercados reales con menos volumen |
+
+Una vez acumulados ≥ 30 paper trades cerrados, revisar estos valores con
+`scripts/funnel_audit.py` y ajustar basado en evidencia real, no en supuestos.
+
+---
+
 ## Veredicto actual
 
 > **Sistema apto para paper trading. Demasiado pronto para evaluar la estrategia.**
