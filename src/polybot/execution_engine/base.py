@@ -1,0 +1,9 @@
+from typing import Protocol
+from ..models import Signal, SizeResult, Trade, PortfolioState
+
+class ExecutionEngine(Protocol):
+    """Interface for execution engines (paper and live)."""
+
+    async def open_position(self, signal: Signal, size: SizeResult) -> Trade: ...
+    async def close_position(self, trade: Trade, current_price: float, reason: str) -> Trade: ...
+    async def mark_to_market(self, trades: list[Trade], prices: dict[str, float]) -> list[Trade]: ...

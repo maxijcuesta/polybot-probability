@@ -1,0 +1,65 @@
+# Polymarket Probabilistic Bot -- Configuration Example
+# Copy to config.toml and customize
+
+[operation]
+paper_trade = true          # START HERE. Set to false for live.
+live_trade = false          # Safety: must ALSO be true for live orders
+dry_run = true
+log_level = "INFO"
+log_json = false            # false = human-readable, true = JSON (for cloud)
+db_path = "./data/polybot.db"
+scan_interval_seconds = 60
+max_concurrent_positions = 5
+heartbeat_interval_minutes = 30
+
+[polymarket]
+clob_base = "https://clob.polymarket.com"
+gamma_base = "https://gamma-api.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Set via environment variables (never in this file):
+# POLYMARKET_API_KEY, POLYMARKET_WALLET_ADDRESS, POLYMARKET_PRIVATE_KEY
+
+[guards]
+min_volume_24h_usd = 10000.0     # minimum $10k daily volume
+min_open_interest_usd = 5000.0   # minimum $5k OI
+max_spread_pct = 0.05            # max 5% spread
+min_depth_usd = 500.0            # min $500 on each side
+max_hours_since_last_trade = 4.0 # stale market: no trades in 4h
+min_yes_price = 0.02             # avoid near-0 markets
+max_yes_price = 0.98             # avoid near-1 markets
+min_time_to_resolution_hours = 4.0
+max_time_to_resolution_days = 90.0
+
+[model]
+model_type = "naive"
+min_edge_raw = 0.04              # 4% raw edge minimum
+min_edge_net = 0.02              # 2% net edge minimum
+calibration_method = "isotonic"
+calibration_min_samples = 30
+
+[costs]
+taker_fee_pct = 0.0
+maker_fee_pct = 0.0
+slippage_model_pct = 0.005       # 0.5% simulated slippage
+gas_cost_usd = 0.01
+
+[risk]
+bankroll_usd = 1000.0
+max_risk_per_trade_pct = 2.0     # 2% of bankroll per trade
+max_portfolio_exposure_pct = 20.0
+kelly_fraction = 0.25            # quarter-Kelly
+use_kelly = true
+daily_loss_limit_usd = 50.0
+max_drawdown_pct = 15.0
+
+[exit]
+take_profit_pct = 0.15           # exit at +15%
+stop_loss_pct = 0.10             # exit at -10%
+max_hold_hours = 72.0
+exit_on_edge_flip = true
+
+[dashboard]
+host = "127.0.0.1"
+port = 8080
+auto_open = true
+refresh_seconds = 30
