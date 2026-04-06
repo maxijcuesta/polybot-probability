@@ -47,6 +47,26 @@ class GuardFailReason(str, Enum):
     TOO_FAR_RESOLUTION = "too_far_resolution"
 
 
+class RejectReason(str, Enum):
+    """Motivos estables por los que el risk engine rechaza un trade completo."""
+    NO_EDGE                  = "no_edge"
+    DAILY_LOSS_LIMIT         = "daily_loss_limit"
+    MAX_DRAWDOWN             = "max_drawdown"
+    MAX_CONCURRENT_POSITIONS = "max_concurrent_positions"
+    DAILY_CAP_EXHAUSTED      = "daily_cap_exhausted"
+    EVENT_CAP_EXHAUSTED      = "event_cap_exhausted"
+    NO_PORTFOLIO_ROOM        = "no_portfolio_room"
+    BELOW_MIN_SIZE           = "below_min_size"
+
+
+class TrimReason(str, Enum):
+    """Motivos estables por los que el trade fue aprobado pero con tamaño reducido."""
+    PORTFOLIO_EXPOSURE_CAP = "portfolio_exposure_cap"
+    DAILY_CAP              = "trimmed_by_daily_cap"
+    EVENT_CAP              = "trimmed_by_event_cap"
+    TRADE_CAP              = "trimmed_by_trade_cap"
+
+
 # ─── MARKET DATA ──────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
@@ -251,6 +271,57 @@ class SizeResult:
     entry_price: float
     kelly_fraction_used: float
     reasoning: str
+
+
+@dataclass(slots=True)
+class SizingDecision:
+    """
+    Siempre devuelto por RiskEngine.size_position() — aprobado o rechazado —
+    con contexto completo para trazabilidad de funnel.
+
+    Reemplaza el patrón SizeResult | None.
+    Los motivos usan RejectReason / TrimReason (enums estables, fáciles de agrupar).
+    """
+    approved: bool
+    signal_id: str
+
+    # ── Tamaños ────────────────────────────────────────────────────────────
+    requested_size_usd: float = 0.0      # tamaño Kelly antes de cualquier cap
+    approved_size_usd: float = 0.0       # tamaño final (0.0 si rechazado)
+
+    # ── Motivos (enums: valores cortos, estables, agrupables) ──────────────
+    reject_reason: RejectReason | None = None   # por qué fue rechazado
+    trim_reason: TrimReason | None = None       # por qué fue recortado (si aplica)
+    risk_limited: bool = False                  # True si algún cap actuó
+    min_size_blocked: bool = False              # True si el rechazo fue por tamaño mínimo
+
+    # ── Snapshot de caps (estado en el momento del sizing) ─────────────────
+    daily_cap_remaining_usd: float | None = None   # cuánto quedaba del cap diario
+    event_cap_remaining_usd: float | None = None   # cuánto quedaba del cap por evento
+
+    # ── Contexto Kelly (para auditar la lógica de sizing) ─────────────────
+    kelly_fraction_raw: float | None = None      # Kelly f puro antes del multiplicador
+    kelly_fraction_applied: float | None = None  # después de kelly_fraction y trade cap
+    bankroll_snapshot_usd: float | None = None   # bankroll en el momento del sizing
+    max_trade_cap_usd: float | None = None       # cap máximo por trade (config)
+
+    # ── Datos de posición (solo cuando approved=True) ──────────────────────
+    size_shares: float = 0.0
+    entry_price: float = 0.0
+    reasoning: str = ""
+
+    def to_size_result(self) -> "SizeResult | None":
+        """Convierte a SizeResult para uso downstream. None si rechazado."""
+        if not self.approved:
+            return None
+        return SizeResult(
+            signal_id=self.signal_id,
+            size_usd=self.approved_size_usd,
+            size_shares=self.size_shares,
+            entry_price=self.entry_price,
+            kelly_fraction_used=self.kelly_fraction_applied or 0.0,
+            reasoning=self.reasoning,
+        )
 
 
 # ─── TRADE / POSITION ────────────────────────────────────────────────────────

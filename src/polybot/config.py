@@ -82,6 +82,8 @@ class RiskConfig:
     use_kelly: bool = True                   # else: fixed fraction
     daily_loss_limit_usd: float = 50.0
     max_drawdown_pct: float = 15.0
+    max_daily_deployment_pct: float = 10.0   # max % bankroll deployed in new positions per day
+    max_event_exposure_pct: float = 5.0      # max % bankroll in a single market/event
 
 
 @dataclass(slots=True)

@@ -3,9 +3,10 @@ import uuid
 import structlog
 from ..models import (
     MarketSnapshot, MarketFeatures, CalibratedPrediction,
-    Signal, CostEstimate, GuardResult, Side, EntryReason
+    Signal, GuardResult, Side, EntryReason
 )
 from ..config import BotConfig
+from ..execution_engine.fill_model import FillModel
 
 logger = structlog.get_logger(__name__)
 
@@ -28,6 +29,7 @@ class SignalEngine:
 
     def __init__(self, config: BotConfig):
         self.config = config
+        self._fill_model = FillModel(config.costs)
 
     def compute_signal(
         self,
@@ -51,9 +53,10 @@ class SignalEngine:
             p_no_model = 1.0 - p_cal
             edge_raw = p_no_model - p_no_market
 
-        # Cost model
-        costs = self._estimate_costs(snapshot, side)
-        edge_net = edge_raw - costs.total
+        # Cost model — uses FillModel (half-spread is the dominant cost)
+        fill = self._fill_model.estimate(snapshot, side)
+        costs = fill.as_cost_estimate
+        edge_net = edge_raw - fill.total_pct
 
         signal = Signal(
             signal_id=str(uuid.uuid4())[:8],
@@ -81,18 +84,6 @@ class SignalEngine:
             actionable=signal.is_actionable,
         )
         return signal
-
-    def _estimate_costs(self, snapshot: MarketSnapshot, side: Side) -> CostEstimate:
-        cc = self.config.costs
-        # Taker: crossing spread
-        spread_cost = snapshot.spread_pct * cc.slippage_model_pct
-        slippage = cc.slippage_model_pct + spread_cost
-        return CostEstimate(
-            taker_fee=cc.taker_fee_pct,
-            maker_fee=cc.maker_fee_pct,
-            slippage=slippage,
-            gas=cc.gas_cost_usd / max(self.config.risk.bankroll_usd * 0.02, 1),  # normalize
-        )
 
     def is_actionable(self, signal: Signal) -> bool:
         if not signal.guard_result.passed:

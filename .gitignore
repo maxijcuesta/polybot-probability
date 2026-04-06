@@ -34,6 +34,26 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Fly.io
+# Fly.io / Docker
 fly.toml
 Dockerfile
+.dockerignore
+
+# Coverage
+.coverage
+coverage.json
+htmlcov/
+
+# Claude Code settings
+.claude/
+
+# Legacy architecture (pre-rebuild — not active code)
+app/
+
+# Legacy tests (written for app/ architecture, not src/polybot/)
+tests/
+
+# Legacy/internal docs
+CHECKPOINT.md
+README_EXECUTIVE.md
+INFRA.md

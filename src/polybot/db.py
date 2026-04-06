@@ -17,10 +17,13 @@ from .models import (
     EntryReason,
     ExitReason,
     MarketSnapshot,
+    RejectReason,
     Side,
     Signal,
+    SizingDecision,
     Trade,
     TradeStatus,
+    TrimReason,
 )
 
 # ─── SCHEMA ───────────────────────────────────────────────────────────────────
@@ -68,7 +71,28 @@ _SCHEMA = """
         guard_passed INTEGER,
         guard_failures TEXT,
         acted_on INTEGER DEFAULT 0,
-        created_at TEXT
+        created_at TEXT,
+        -- cohort fields for diagnostics / audit
+        spread_pct REAL,
+        volume_24h REAL,
+        open_interest REAL,
+        hours_to_resolution REAL,
+        bid_depth_usd REAL,
+        -- cost / funnel fields
+        fill_total_pct REAL,
+        requested_size_usd REAL,
+        approved_size_usd REAL,
+        reject_reason TEXT,
+        trim_reason TEXT,
+        risk_limited INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS funnel_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id TEXT NOT NULL,
+        event_name TEXT NOT NULL,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -124,11 +148,96 @@ def _ensure_dir(db_path: str) -> None:
 # ─── SCHEMA MANAGEMENT ────────────────────────────────────────────────────────
 
 async def ensure_schema(db_path: str) -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, then apply migrations."""
     _ensure_dir(db_path)
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(_SCHEMA)
+        await _migrate_schema(db)
         await db.commit()
+
+
+async def _migrate_schema(db: aiosqlite.Connection) -> None:
+    """
+    Migraciones idempotentes para DBs existentes.
+
+    1. Agrega columnas nuevas a `signals` si no existen (ALTER TABLE es seguro).
+    2. Si `funnel_events` existe con el schema wide (columna markets_fetched),
+       migra los datos al formato EAV y renombra la tabla vieja.
+    """
+    # ── Nuevas columnas en signals ─────────────────────────────────────────
+    _signal_cols = [
+        ("spread_pct", "REAL"),
+        ("volume_24h", "REAL"),
+        ("open_interest", "REAL"),
+        ("hours_to_resolution", "REAL"),
+        ("bid_depth_usd", "REAL"),
+        ("fill_total_pct", "REAL"),
+        ("requested_size_usd", "REAL"),
+        ("approved_size_usd", "REAL"),
+        ("reject_reason", "TEXT"),
+        ("trim_reason", "TEXT"),
+        ("risk_limited", "INTEGER"),
+    ]
+    for col, typ in _signal_cols:
+        try:
+            await db.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+        except Exception:
+            pass  # la columna ya existe — ok
+
+    # ── Migración funnel_events: wide → EAV ───────────────────────────────
+    #
+    # Idempotencia garantizada de la siguiente forma:
+    #   - Si funnel_events ya es EAV (no tiene "markets_fetched"): no hacer nada.
+    #   - Si funnel_events es wide Y el backup no existe: migrar y renombrar.
+    #   - Si funnel_events es wide Y el backup ya existe: la migración se ejecutó
+    #     previamente pero falló a medias; no intentar el RENAME (fallaría de
+    #     todos modos), solo recrear la tabla EAV con los datos del wide que aún
+    #     está ahí, usando un nombre de backup con timestamp para no colisionar.
+    async with db.execute("PRAGMA table_info(funnel_events)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+
+    if "markets_fetched" in cols:
+        # Schema wide detectado
+        _wide_fields = [
+            "markets_fetched", "passed_guards", "signals_computed",
+            "positive_edge_net", "risk_approved", "executed", "exited",
+        ]
+        async with db.execute(
+            "SELECT cycle_id, created_at, " + ", ".join(_wide_fields) + " FROM funnel_events"
+        ) as cur:
+            old_rows = await cur.fetchall()
+
+        # Elegir nombre del backup que no colisione
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='funnel_events_wide_backup'"
+        ) as cur:
+            backup_exists = (await cur.fetchone()) is not None
+
+        backup_name = (
+            "funnel_events_wide_backup"
+            if not backup_exists
+            else f"funnel_events_wide_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        await db.execute(f"ALTER TABLE funnel_events RENAME TO {backup_name}")
+
+        await db.execute("""
+            CREATE TABLE funnel_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        for row in old_rows:
+            cycle_id, created_at = row[0], row[1]
+            for i, field in enumerate(_wide_fields):
+                count = row[2 + i] or 0
+                await db.execute(
+                    "INSERT INTO funnel_events (cycle_id, event_name, event_count, created_at) VALUES (?, ?, ?, ?)",
+                    (cycle_id, field, count, created_at or ""),
+                )
 
 
 # ─── TRADES ───────────────────────────────────────────────────────────────────
@@ -355,13 +464,23 @@ async def load_trade(db_path: str, trade_id: str) -> Trade | None:
 
 async def save_signal(db_path: str, signal: Signal, acted_on: bool = False) -> None:
     """Log a trading signal to the signals table."""
+    features = signal.features
+    spread_pct = float(features.spread_pct) if features and hasattr(features, "spread_pct") else None
+    volume_24h = float(features.volume_24h) if features and hasattr(features, "volume_24h") else None
+    open_interest = float(features.open_interest) if features and hasattr(features, "open_interest") else None
+    hours_to_res = float(features.hours_to_resolution) if features and hasattr(features, "hours_to_resolution") else None
+    bid_depth = float(features.bid_depth_usd) if features and hasattr(features, "bid_depth_usd") else None
+    fill_total_pct = round(signal.costs.total, 6) if signal.costs else None
+
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
             INSERT OR REPLACE INTO signals (
                 signal_id, market_id, side, p_market, p_model, p_calibrated,
-                edge_raw, edge_net, guard_passed, guard_failures, acted_on, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                edge_raw, edge_net, guard_passed, guard_failures, acted_on, created_at,
+                spread_pct, volume_24h, open_interest, hours_to_resolution, bid_depth_usd,
+                fill_total_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.signal_id,
@@ -376,6 +495,12 @@ async def save_signal(db_path: str, signal: Signal, acted_on: bool = False) -> N
                 json.dumps([f.value for f in signal.guard_result.failures]),
                 1 if acted_on else 0,
                 _dt_to_str(signal.created_at),
+                spread_pct,
+                volume_24h,
+                open_interest,
+                hours_to_res,
+                bid_depth,
+                fill_total_pct,
             ),
         )
         await db.commit()
@@ -475,6 +600,172 @@ async def load_calibration_data(
 
 
 # ─── ANALYTICS / SUMMARY ──────────────────────────────────────────────────────
+
+async def update_signal_sizing(
+    db_path: str,
+    signal_id: str,
+    decision: SizingDecision,
+) -> None:
+    """
+    Actualiza los campos de sizing en la fila de señal ya guardada.
+    Llamado inmediatamente después de RiskEngine.size_position().
+
+    Los enums RejectReason / TrimReason se persisten como su .value (str corto).
+    """
+    reject_val = decision.reject_reason.value if isinstance(decision.reject_reason, RejectReason) else decision.reject_reason
+    trim_val   = decision.trim_reason.value   if isinstance(decision.trim_reason,   TrimReason)   else decision.trim_reason
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            UPDATE signals
+            SET requested_size_usd = ?,
+                approved_size_usd  = ?,
+                reject_reason      = ?,
+                trim_reason        = ?,
+                risk_limited       = ?,
+                acted_on           = ?
+            WHERE signal_id = ?
+            """,
+            (
+                decision.requested_size_usd,
+                decision.approved_size_usd,
+                reject_val,
+                trim_val,
+                1 if decision.risk_limited else 0,
+                1 if decision.approved else 0,
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
+# ── Nombre canónico del evento de funnel → descripción legible ────────────────
+FUNNEL_EVENT_NAMES: tuple[str, ...] = (
+    "markets_fetched",
+    "passed_guards",
+    "signals_computed",
+    "positive_edge_net",
+    "already_positioned",  # accionables omitidos por posición existente en ese mercado
+    "risk_approved",
+    "risk_rejected",
+    "risk_trimmed",        # subset de risk_approved con size recortado
+    "executed",
+    "exited",
+)
+
+
+async def save_funnel_events(
+    db_path: str,
+    cycle_id: str,
+    counts: dict[str, int],
+    created_at: str | None = None,
+) -> None:
+    """
+    Persiste los contadores de funnel de un ciclo en formato EAV.
+
+    Formato: una fila por event_name, para que agregar nuevos eventos
+    no requiera cambios de schema.
+
+    Args:
+        cycle_id:    identificador del ciclo (uuid corto)
+        counts:      dict { event_name → int }
+        created_at:  ISO8601; si None usa utc_now
+    """
+    ts = created_at or _dt_to_str(datetime.now(timezone.utc))
+    async with aiosqlite.connect(db_path) as db:
+        for name, count in counts.items():
+            await db.execute(
+                "INSERT INTO funnel_events (cycle_id, event_name, event_count, created_at) VALUES (?, ?, ?, ?)",
+                (cycle_id, name, count or 0, ts),
+            )
+        await db.commit()
+
+
+async def load_funnel_totals(db_path: str) -> dict[str, int]:
+    """
+    Devuelve la suma acumulada de cada event_name en toda la historia.
+
+    Útil para la pirámide del funnel audit.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT event_name, SUM(event_count) FROM funnel_events GROUP BY event_name"
+        ) as cur:
+            rows = await cur.fetchall()
+    return {row[0]: (row[1] or 0) for row in rows}
+
+
+async def load_funnel_events_raw(
+    db_path: str, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Filas crudas de funnel_events, más recientes primero (para análisis de tendencia)."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, cycle_id, event_name, event_count, created_at
+            FROM funnel_events
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def load_signals_for_audit(db_path: str, limit: int = 10_000) -> list[dict[str, Any]]:
+    """
+    Load signals with all cohort and sizing fields for funnel audit.
+    Joins with trades to include resolution outcome and PnL.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                s.signal_id,
+                s.market_id,
+                s.side,
+                s.p_market,
+                s.p_model,
+                s.p_calibrated,
+                s.edge_raw,
+                s.edge_net,
+                s.guard_passed,
+                s.guard_failures,
+                s.acted_on,
+                s.created_at,
+                s.spread_pct,
+                s.volume_24h,
+                s.open_interest,
+                s.hours_to_resolution,
+                s.bid_depth_usd,
+                s.fill_total_pct,
+                s.requested_size_usd,
+                s.approved_size_usd,
+                s.reject_reason,
+                s.trim_reason,
+                s.risk_limited,
+                t.trade_id,
+                t.status      AS trade_status,
+                t.pnl_usd,
+                t.pnl_pct,
+                t.outcome,
+                t.entry_price,
+                t.exit_price,
+                t.exit_reason
+            FROM signals s
+            LEFT JOIN trades t ON t.signal_id = s.signal_id
+            ORDER BY s.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
 
 async def get_performance_summary(db_path: str) -> dict[str, Any]:
     """
