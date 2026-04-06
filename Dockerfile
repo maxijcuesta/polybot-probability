@@ -22,9 +22,8 @@ COPY . .
 # Directorio para logs locales (la DB va en el volumen /data)
 RUN mkdir -p logs
 
-# Usuario no-root
-RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
-USER botuser
+# Nota: corre como root para que el volumen /data (montado por Fly.io) sea
+# escribible en el primer arranque. Aceptable para un bot de investigación.
 
 # Health check: el dashboard expone /health en 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

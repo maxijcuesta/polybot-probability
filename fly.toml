@@ -52,7 +52,7 @@ primary_region = "iad"   # us-east — menor latencia a Polymarket
     method       = "GET"
     path         = "/health"
 
-[[vm]]
+[vm]
   # shared-cpu-1x, 256MB RAM — suficiente para paper mode
   # Fly.io incluye 3 VMs shared en el free allowance
   cpu_kind  = "shared"
