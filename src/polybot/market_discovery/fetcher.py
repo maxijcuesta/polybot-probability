@@ -6,6 +6,7 @@ All errors are caught and logged — never crash the scan loop.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -60,39 +61,85 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _parse_json_string(value: Any) -> list:
+    """Parse a JSON-encoded string like '["a","b"]' into a list. Returns [] on failure."""
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        result = json.loads(value)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _parse_gamma_market(raw: dict[str, Any]) -> MarketSnapshot | None:
     """
     Convert a Gamma API market dict to MarketSnapshot.
 
-    Gamma API response fields of interest:
-        id, conditionId, question, category, tokens (list with outcome/token_id),
-        volume24hr, volume, openInterest, lastTradePrice, endDate, active,
-        bestAsk, bestBid
+    Supports two API formats:
+      Old: tokens=[{"token_id":...}], bestBid, bestAsk, openInterest
+      New: clobTokenIds='["id1","id2"]', outcomePrices='["0.52","0.48"]', liquidityNum
     """
     try:
+        # ── Token IDs ─────────────────────────────────────────────────────────
+        # Old: raw["tokens"] = [{"token_id": "yes_id"}, {"token_id": "no_id"}]
+        # New: raw["clobTokenIds"] = '["yes_id", "no_id"]'  (JSON-encoded string)
         tokens: list[dict] = raw.get("tokens", [])
-        if len(tokens) < 2:
-            # Some markets have 1 token — skip non-binary
-            return None
-
-        # YES token is first, NO token is second (Polymarket convention)
-        yes_token_id = str(tokens[0].get("token_id", ""))
-        no_token_id = str(tokens[1].get("token_id", ""))
+        if len(tokens) >= 2:
+            yes_token_id = str(tokens[0].get("token_id", ""))
+            no_token_id  = str(tokens[1].get("token_id", ""))
+        else:
+            ids = _parse_json_string(raw.get("clobTokenIds", "[]"))
+            if len(ids) < 2:
+                logger.debug(
+                    "fetcher.parse_skip_no_tokens",
+                    market_id=raw.get("id", "?"),
+                    has_tokens=bool(tokens),
+                    has_clob_ids=bool(raw.get("clobTokenIds")),
+                )
+                return None
+            yes_token_id = str(ids[0])
+            no_token_id  = str(ids[1])
 
         if not yes_token_id or not no_token_id:
             return None
 
-        market_id = str(raw.get("id", raw.get("conditionId", "")))
+        market_id    = str(raw.get("id", raw.get("conditionId", "")))
         condition_id = str(raw.get("conditionId", raw.get("id", "")))
 
+        # ── Prices ────────────────────────────────────────────────────────────
+        # Old: bestBid / bestAsk at top level (floats)
+        # New: outcomePrices = '["0.525", "0.475"]' — YES price / NO price
+        #      outcomePrices[0] is a mid-price approximation for YES.
+        #      The CLOB orderbook fetch will refine real bid/ask later.
         best_bid = _parse_float(raw.get("bestBid", raw.get("best_bid", 0.0)))
-        best_ask = _parse_float(raw.get("bestAsk", raw.get("best_ask", 1.0)))
+        best_ask = _parse_float(raw.get("bestAsk", raw.get("best_ask", 0.0)))
+
+        if best_bid == 0.0 and best_ask == 0.0:
+            prices = _parse_json_string(raw.get("outcomePrices", "[]"))
+            if prices:
+                yes_price = _parse_float(prices[0])
+                # Use YES price as mid approximation; bid/ask spread added by sanity check
+                best_bid = yes_price
+                best_ask = yes_price  # triggers best_ask <= best_bid below → +0.01
 
         # Sanity bounds
         best_bid = max(0.0, min(1.0, best_bid))
         best_ask = max(0.0, min(1.0, best_ask))
         if best_ask <= best_bid:
             best_ask = min(1.0, best_bid + 0.01)
+
+        # ── Open Interest ─────────────────────────────────────────────────────
+        # Old: openInterest (float) at top level
+        # New: absent at market level; liquidityNum (float) is the closest proxy
+        open_interest = _parse_float(
+            raw.get("openInterest")
+            or raw.get("liquidityNum")
+            or raw.get("liquidity")
+            or 0.0
+        )
 
         return MarketSnapshot(
             market_id=market_id,
@@ -105,7 +152,7 @@ def _parse_gamma_market(raw: dict[str, Any]) -> MarketSnapshot | None:
             best_ask=best_ask,
             volume_24h=_parse_float(raw.get("volume24hr", raw.get("volumeClob", 0.0))),
             volume_total=_parse_float(raw.get("volume", 0.0)),
-            open_interest=_parse_float(raw.get("openInterest", 0.0)),
+            open_interest=open_interest,
             last_trade_price=_parse_float(raw.get("lastTradePrice", 0.0)),
             last_trade_time=_parse_datetime(raw.get("lastTradeTime")),
             resolution_time=_parse_datetime(raw.get("endDate")),
