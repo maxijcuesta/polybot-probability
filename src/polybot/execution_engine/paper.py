@@ -76,14 +76,21 @@ class PaperExecutionEngine:
             fill_price = min(current_price + slippage, 0.99)
 
         # PnL calculation
+        # YES side: we hold a YES token; profit when price rises
+        #   pnl_per_share = fill_price - entry_price  (both are YES prices)
+        #   cost_per_share = entry_price
+        # NO side: we hold a NO token; profit when YES price falls
+        #   pnl_per_share = entry_price - fill_price  (YES price fell = our gain)
+        #   cost_per_share = 1.0 - entry_price  (NO token cost = 1 - YES price)
         if trade.side == Side.YES:
             pnl_per_share = fill_price - trade.entry_price
+            cost_per_share = trade.entry_price
         else:
-            # NO side: we bought (1 - entry_price) as entry
-            pnl_per_share = (1.0 - fill_price) - trade.entry_price
+            pnl_per_share = trade.entry_price - fill_price
+            cost_per_share = 1.0 - trade.entry_price
 
         pnl_usd = pnl_per_share * trade.entry_shares
-        pnl_pct = pnl_per_share / trade.entry_price if trade.entry_price > 0 else 0
+        pnl_pct = pnl_per_share / cost_per_share if cost_per_share > 0 else 0
 
         # MAE/MFE
         history = self._price_history.get(trade.trade_id, [current_price])
@@ -162,7 +169,8 @@ class PaperExecutionEngine:
         if trade.side == Side.YES:
             pnl_pct = (current_price - trade.entry_price) / trade.entry_price
         else:
-            pnl_pct = (trade.entry_price - current_price) / trade.entry_price
+            cost = 1.0 - trade.entry_price
+            pnl_pct = (trade.entry_price - current_price) / cost if cost > 0 else 0
 
         if pnl_pct >= ec.take_profit_pct:
             return True, ExitReason.TAKE_PROFIT.value
