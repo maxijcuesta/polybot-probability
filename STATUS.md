@@ -73,6 +73,80 @@ approved_size_usd ≤ requested_size_usd  (nunca se aprueba más de lo pedido)
 
 ---
 
+## Estado de validación del scorer (actualizado 2026-04-09)
+
+**Pregunta a responder:** ¿el `InefficiencyScorer` selecciona trades mejores que una baseline trivial?
+
+**Estado actual:** sin evidencia — todavía no hay suficientes trades cerrados con outcome conocido.
+
+Para responder esta pregunta, ejecutar:
+```bash
+python scripts/cohort_report.py --db ./data/polybot.db
+```
+
+El reporte clasifica los trades cerrados en quintiles por `final_trade_score` y calcula:
+- hit rate por quintil
+- PnL promedio y total por quintil
+- Brier score por quintil (requiere outcomes resueltos)
+- direction accuracy (suggested_side vs resolución real)
+
+**Veredicto automático del reporte:**
+- Si Q5 supera Q1 en >10pp de hit rate Y avg PnL: "scorer CORRELACIONA con outcomes"
+- Si no: "SIN CORRELACIÓN DETECTABLE — el scorer actual NO demuestra edge"
+
+Hasta tener ≥ 10 trades cerrados, el reporte emite "DATOS INSUFICIENTES".
+
+---
+
+## CLOB y evidencia de edge sin datos de orderbook
+
+**Limitación estructural del modelo actual:**
+
+El `InefficiencyModel` usa como señal principal:
+```
+p_yes = mid + depth_imbalance × (spread / 2)
+```
+
+Sin acceso al CLOB API de Polymarket, `depth_imbalance = 0` siempre:
+- `FeatureBuilder` usa `bid_depth = ask_depth = OI/2` como fallback
+- Resultado: `edge_raw = 0`, `edge_net = -slippage` en todos los mercados
+- El risk engine usa fixed-fraction sizing (no Kelly) para todos los trades
+
+Los componentes del scorer que funcionan sin CLOB:
+| Componente | Depende de CLOB | Estado |
+|---|---|---|
+| `microprice_gap` | Sí | Siempre 0 |
+| `book_imbalance` | Sí | Siempre 0 |
+| `spread_signal` | No | Activo |
+| `price_centrality` | No | Activo |
+| `vol_activity` | No | Activo |
+| `staleness` | No | Activo |
+| `resolution_window` | No | Activo |
+
+Los 3 componentes activos miden **calidad de ejecución**, no **mispricing**.
+Seleccionar los mercados con mejor spread + centralidad + volumen no equivale a encontrar mercados mal priceados.
+
+**Consecuencia:** el sistema actual es operativamente indistinguible de selección aleatoria entre mercados líquidos y frescos.
+
+**Ruta mínima para incorporar CLOB:**
+1. Obtener API key gratuita en polymarket.com (sección "API")
+2. Agregar a variables de entorno en Fly.io:
+   ```
+   POLYMARKET_API_KEY=...
+   POLYMARKET_WALLET_ADDRESS=0x...
+   ```
+3. En `cycle.py`, antes de `self.features.build(market)`:
+   ```python
+   # Enriquecer snapshot con datos de orderbook real
+   markets = await self.fetcher.enrich_with_orderbooks(markets)
+   ```
+   La función `enrich_with_orderbooks()` ya está implementada en `fetcher.py`.
+4. Con depth real: `depth_imbalance ≠ 0` → `microprice_gap` y `book_imbalance` toman valores reales → el modelo y el scorer funcionan según diseño.
+
+**Sin CLOB**, el único camino para demostrar edge es acumular suficientes trades cerrados y que el `cohort_report.py` detecte correlación entre `spread_signal + resolution_window` y outcomes reales — lo cual es posible pero menos probable que con señal de orderbook.
+
+---
+
 ## Thresholds de paper trading (cloud)
 
 Los umbrales en `config.cloud.toml` fueron bajados deliberadamente para destrabar la

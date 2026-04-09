@@ -84,7 +84,21 @@ _SCHEMA = """
         approved_size_usd REAL,
         reject_reason TEXT,
         trim_reason TEXT,
-        risk_limited INTEGER
+        risk_limited INTEGER,
+        -- InefficiencyScorer output (saved for ALL guard-passed markets)
+        final_trade_score REAL,
+        inefficiency_score REAL,
+        execution_score REAL,
+        suggested_side TEXT,
+        -- Score components (for cohort drill-down)
+        microprice_gap REAL,
+        spread_signal REAL,
+        book_imbalance REAL,
+        price_centrality REAL,
+        vol_activity REAL,
+        spread_cost REAL,
+        staleness REAL,
+        resolution_window REAL
     );
 
     CREATE TABLE IF NOT EXISTS funnel_events (
@@ -177,6 +191,19 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         ("reject_reason", "TEXT"),
         ("trim_reason", "TEXT"),
         ("risk_limited", "INTEGER"),
+        # InefficiencyScorer columns — added when this migration runs
+        ("final_trade_score", "REAL"),
+        ("inefficiency_score", "REAL"),
+        ("execution_score", "REAL"),
+        ("suggested_side", "TEXT"),
+        ("microprice_gap", "REAL"),
+        ("spread_signal", "REAL"),
+        ("book_imbalance", "REAL"),
+        ("price_centrality", "REAL"),
+        ("vol_activity", "REAL"),
+        ("spread_cost", "REAL"),
+        ("staleness", "REAL"),
+        ("resolution_window", "REAL"),
     ]
     for col, typ in _signal_cols:
         try:
@@ -516,6 +543,53 @@ async def mark_signal_acted_on(db_path: str, signal_id: str) -> None:
         await db.commit()
 
 
+async def update_signal_score(db_path: str, signal_id: str, score: Any) -> None:
+    """
+    Persist InefficiencyScore fields for a signal.
+
+    Called for every guard-passed market (not just top-N candidates) so
+    cohort analysis can compare selected vs non-selected markets.
+
+    Args:
+        score: InefficiencyScore dataclass instance from scoring.scorer.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            UPDATE signals SET
+                final_trade_score = ?,
+                inefficiency_score = ?,
+                execution_score    = ?,
+                suggested_side     = ?,
+                microprice_gap     = ?,
+                spread_signal      = ?,
+                book_imbalance     = ?,
+                price_centrality   = ?,
+                vol_activity       = ?,
+                spread_cost        = ?,
+                staleness          = ?,
+                resolution_window  = ?
+            WHERE signal_id = ?
+            """,
+            (
+                score.final_trade_score,
+                score.inefficiency_score,
+                score.execution_score,
+                score.suggested_side,
+                score.microprice_gap,
+                score.spread_signal,
+                score.book_imbalance,
+                score.price_centrality,
+                score.vol_activity,
+                score.spread_cost,
+                score.staleness,
+                score.resolution_window,
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
 # ─── MARKET SNAPSHOTS ─────────────────────────────────────────────────────────
 
 async def save_market_snapshot(db_path: str, snapshot: MarketSnapshot) -> None:
@@ -759,6 +833,112 @@ async def load_signals_for_audit(db_path: str, limit: int = 10_000) -> list[dict
             FROM signals s
             LEFT JOIN trades t ON t.signal_id = s.signal_id
             ORDER BY s.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def load_cohort_data(db_path: str) -> list[dict[str, Any]]:
+    """
+    Load closed trades joined with their InefficiencyScore data.
+
+    Used by scripts/cohort_report.py to answer:
+    "Does final_trade_score correlate with better outcomes?"
+
+    Returns:
+        List of dicts with trade + score fields.
+        Includes ALL guard-passed signals (acted_on=0 ones too) so the
+        report can compare selected vs non-selected markets side-by-side.
+        Rows without a final_trade_score are excluded (pre-scorer trades).
+    """
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                t.trade_id,
+                t.market_id,
+                t.side            AS trade_side,
+                t.status,
+                t.pnl_usd,
+                t.pnl_pct,
+                t.outcome,
+                t.entry_price,
+                t.exit_price,
+                t.exit_reason,
+                t.entry_size_usd,
+                t.p_calibrated,
+                s.signal_id,
+                s.final_trade_score,
+                s.inefficiency_score,
+                s.execution_score,
+                s.suggested_side,
+                s.microprice_gap,
+                s.spread_signal,
+                s.book_imbalance,
+                s.price_centrality,
+                s.vol_activity,
+                s.spread_cost,
+                s.staleness,
+                s.resolution_window,
+                s.acted_on,
+                s.spread_pct,
+                s.hours_to_resolution
+            FROM trades t
+            JOIN signals s ON s.signal_id = t.signal_id
+            WHERE t.status = 'closed'
+              AND s.final_trade_score IS NOT NULL
+            ORDER BY s.final_trade_score ASC
+            """,
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def load_all_scored_signals(db_path: str, limit: int = 10_000) -> list[dict[str, Any]]:
+    """
+    Load all guard-passed signals that have a score (acted_on or not).
+
+    Used by cohort_report to show the full scored universe, not just
+    the trades that were executed.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                s.signal_id,
+                s.market_id,
+                s.side,
+                s.guard_passed,
+                s.acted_on,
+                s.final_trade_score,
+                s.inefficiency_score,
+                s.execution_score,
+                s.suggested_side,
+                s.microprice_gap,
+                s.spread_signal,
+                s.book_imbalance,
+                s.price_centrality,
+                s.vol_activity,
+                s.spread_cost,
+                s.staleness,
+                s.resolution_window,
+                s.spread_pct,
+                s.hours_to_resolution,
+                s.created_at,
+                t.trade_id,
+                t.status      AS trade_status,
+                t.pnl_usd,
+                t.outcome,
+                t.p_calibrated
+            FROM signals s
+            LEFT JOIN trades t ON t.signal_id = s.signal_id
+            WHERE s.final_trade_score IS NOT NULL
+            ORDER BY s.final_trade_score DESC
             LIMIT ?
             """,
             (limit,),

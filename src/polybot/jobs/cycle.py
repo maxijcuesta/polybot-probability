@@ -170,8 +170,13 @@ class BotCycle:
                     rejection_counts[key] = rejection_counts.get(key, 0) + 1
                     continue
 
-                # Gate 2: score the market
+                # Score ALL guard-passed markets — even those below min_final_score.
+                # Saving score for non-selected markets lets cohort_report.py compare
+                # the selected vs non-selected populations and measure scorer validity.
                 score = self.scorer.score(market, feats)
+                await storage.update_signal_score(
+                    self.config.operation.db_path, sig.signal_id, score
+                )
 
                 if score.final_trade_score < self.config.scoring.min_final_score:
                     key = (
@@ -277,7 +282,24 @@ class BotCycle:
                 should_exit, reason = self.executor.should_exit(trade, current_price)
                 if should_exit:
                     closed_trade = await self.executor.close_position(trade, current_price, reason)
-                    await storage.update_trade_exit(self.config.operation.db_path, closed_trade)
+                    await storage.update_trade_exit(
+                        self.config.operation.db_path,
+                        closed_trade.trade_id,
+                        {
+                            "exit_price":    closed_trade.exit_price,
+                            "exit_time":     closed_trade.exit_time,
+                            "exit_reason":   closed_trade.exit_reason,
+                            "pnl_usd":       closed_trade.pnl_usd,
+                            "pnl_pct":       closed_trade.pnl_pct,
+                            "slippage_exit": closed_trade.slippage_exit,
+                            "mae_usd":       closed_trade.mae_usd,
+                            "mfe_usd":       closed_trade.mfe_usd,
+                            "outcome":       closed_trade.outcome,
+                            "status":        closed_trade.status,
+                            "notes":         closed_trade.notes,
+                            "updated_at":    closed_trade.updated_at,
+                        },
+                    )
                     self._portfolio.open_trades = [
                         t for t in self._portfolio.open_trades if t.trade_id != trade.trade_id
                     ]
